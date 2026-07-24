@@ -1,0 +1,270 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+
+namespace PowerTray
+{
+    // ----- 电源计划数据 -----
+    public class PowerPlan
+    {
+        public Guid Guid { get; set; }
+        public string Name { get; set; } = "";
+        public bool IsActive { get; set; }
+
+        public override string ToString()
+        {
+            return IsActive ? "● " + Name : Name;
+        }
+    }
+
+    // ----- 主窗体 -----
+    public class MainForm : Form
+    {
+        private ListBox listBoxPlans;
+        private NotifyIcon trayIcon;
+        private ContextMenuStrip trayMenu;
+        private bool closeToTray = true;   // 点击 × 最小化到托盘
+
+        public MainForm()
+        {
+            // 窗口设置
+            this.Text = "电源计划切换器";
+            this.Width = 320;
+            this.Height = 280;
+            this.FormBorderStyle = FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
+            this.MinimizeBox = true;
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.Icon =  new Icon("app.ico");
+
+            // 列表
+            listBoxPlans = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("微软雅黑", 10F),
+                IntegralHeight = false
+            };
+            listBoxPlans.SelectedIndexChanged += ListBoxPlans_SelectedIndexChanged;
+            this.Controls.Add(listBoxPlans);
+
+            // 托盘
+            trayIcon = new NotifyIcon
+            {
+                Icon = new Icon("app.ico"),
+                Text = "电源计划切换器",
+                Visible = true
+            };
+            trayIcon.DoubleClick += (s, e) => ShowWindow();
+
+            // 托盘右键菜单
+            trayMenu = new ContextMenuStrip();
+            trayIcon.ContextMenuStrip = trayMenu;
+
+            // 事件
+            this.Resize += MainForm_Resize;
+            this.FormClosing += MainForm_FormClosing;
+
+            // 加载数据
+            RefreshAll();
+        }
+
+        private void RefreshAll()
+        {
+            RefreshList();
+            RefreshTrayMenu();
+        }
+
+        private void RefreshList()
+        {
+            var plans = GetPowerPlans();
+            listBoxPlans.Items.Clear();
+            foreach (var plan in plans)
+                listBoxPlans.Items.Add(plan);
+        }
+
+        private void RefreshTrayMenu()
+        {
+            trayMenu.Items.Clear();
+            var plans = GetPowerPlans();
+            foreach (var plan in plans)
+            {
+                var item = new ToolStripMenuItem(plan.ToString()); // 自带 ●
+                item.Tag = plan.Guid;
+                item.Click += OnTrayItemClick;
+                trayMenu.Items.Add(item);
+            }
+            trayMenu.Items.Add(new ToolStripSeparator());
+            var exitItem = new ToolStripMenuItem("退出");
+            exitItem.Click += (s, e) => ExitApplication();
+            trayMenu.Items.Add(exitItem);
+        }
+
+        private List<PowerPlan> GetPowerPlans()
+        {
+            var list = new List<PowerPlan>();
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powercfg",
+                    Arguments = "-list",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit();
+                    var lines = output.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        var match = Regex.Match(line, @"([0-9a-fA-F\-]{36})\s+\((.+?)\)\s*(?:\[.*\])?");
+                        if (match.Success)
+                        {
+                            var guid = Guid.Parse(match.Groups[1].Value);
+                            var name = match.Groups[2].Value.Trim();
+                            bool isActive = line.Contains("[*]") || line.Contains("[当前]");
+                            list.Add(new PowerPlan { Guid = guid, Name = name, IsActive = isActive });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("获取电源计划失败: " + ex.Message);
+            }
+            return list;
+        }
+
+        private bool SetActivePlan(Guid guid)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powercfg",
+                    Arguments = $"-setactive {guid}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                Process.Start(psi)?.WaitForExit();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // ----- 列表点击 -----
+        private void ListBoxPlans_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (listBoxPlans.SelectedItem is PowerPlan plan)
+            {
+                if (plan.IsActive)
+                {
+                    listBoxPlans.SelectedIndex = -1;
+                    return;
+                }
+                if (SetActivePlan(plan.Guid))
+                {
+                    RefreshAll();
+                    trayIcon.ShowBalloonTip(1500, "电源计划", $"已切换到：{plan.Name}", ToolTipIcon.Info);
+                }
+                else
+                {
+                    MessageBox.Show("切换失败，请以管理员身份运行！", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                listBoxPlans.SelectedIndex = -1;
+            }
+        }
+
+        // ----- 托盘菜单点击 -----
+        private void OnTrayItemClick(object sender, EventArgs e)
+        {
+            var item = (ToolStripMenuItem)sender;
+            var guid = (Guid)item.Tag;
+            var plans = GetPowerPlans();
+            var plan = plans.Find(p => p.Guid == guid);
+            if (plan != null && plan.IsActive)
+            {
+                trayIcon.ShowBalloonTip(1000, "提示", "已是当前计划", ToolTipIcon.Info);
+                return;
+            }
+            if (SetActivePlan(guid))
+            {
+                RefreshAll();
+                trayIcon.ShowBalloonTip(1500, "电源计划", $"已切换到：{plan?.Name ?? "未知"}", ToolTipIcon.Info);
+            }
+            else
+            {
+                trayIcon.ShowBalloonTip(2000, "错误", "切换失败，请以管理员身份运行", ToolTipIcon.Error);
+            }
+        }
+
+        // ----- 窗口行为 -----
+        private void MainForm_Resize(object sender, EventArgs e)
+        {
+            if (this.WindowState == FormWindowState.Minimized)
+                HideWindow();
+        }
+
+        private void HideWindow()
+        {
+            this.Hide();
+            this.ShowInTaskbar = false;
+            trayIcon.Visible = true;
+        }
+
+        private void ShowWindow()
+        {
+            this.Show();
+            this.WindowState = FormWindowState.Normal;
+            this.ShowInTaskbar = true;
+            trayIcon.Visible = true;
+        }
+
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                if (closeToTray)
+                {
+                    e.Cancel = true;
+                    HideWindow();
+                    trayIcon.ShowBalloonTip(2000, "电源计划", "已最小化到托盘，右键图标可切换。", ToolTipIcon.Info);
+                }
+                else
+                {
+                    ExitApplication();
+                }
+            }
+        }
+
+        private void ExitApplication()
+        {
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            Application.Exit();
+        }
+
+        // 可选的公开方法，用于改变关闭行为（这里暂不实现界面选项）
+        public void SetCloseToTray(bool value) => closeToTray = value;
+    }
+
+    // ----- 入口 -----
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+}
